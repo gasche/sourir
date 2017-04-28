@@ -607,12 +607,12 @@ let do_test_minimize_lifetime = function () ->
   assert_equal (Disasm.disassemble_s res) (Disasm.disassemble_s expected);
   ()
 
-let do_test_const_prop_driver () =
+let do_test_const_fold_driver () =
   let open Transform in
   let test t e =
     let input, expected = (parse t), (parse e) in
-    let output = { input with main = try_opt const_prop input.main } in
-    if (active_version output.main).instrs <> (active_version expected.main).instrs then begin
+    let output = try_opt (as_opt_program const_fold) input in
+    if (Disasm.disassemble_s output) <> (Disasm.disassemble_s expected) then begin
       Printf.printf "input: '%s'\noutput: '%s'\nexpected: '%s'\n%!"
         (Disasm.disassemble_s input)
         (Disasm.disassemble_s output)
@@ -620,16 +620,39 @@ let do_test_const_prop_driver () =
       assert false
     end in
 
-  (* Simple test case; sanity check *)
+  (* Simple constant propagation test case; sanity check *)
   test {input|
     const x = 1
     print x
   |input} {expect|
     print 1
   |expect};
-  (* Test with branching *)
+  (* No copy propagation allowed *)
+  test {input|
+    mut w = 0
+    const z = w
+    w <- 1
+    print w
+    print z
+  |input} {expect|
+    mut w = 0
+    const z = w
+    w <- 1
+    print w
+    print z
+  |expect};
+  (* Folding and propagation *)
   test {input|
     const x = 1
+    const y = (2 + x)
+    const z = (3 + y)
+    print z
+  |input} {expect|
+    print 6
+  |expect};
+  (* Test with branching *)
+  test {input|
+    const x = (1 + 0)
     branch (1==1) l1 l2
    l1:
     drop x
@@ -650,7 +673,7 @@ let do_test_const_prop_driver () =
     stop 0
   |input} {expect|
     const x = 1
-    branch (1==1) l1 l2
+    branch true l1 l2
    l1:
     drop x
     goto next
@@ -660,7 +683,7 @@ let do_test_const_prop_driver () =
     goto next
    next:
     const y = 1
-    branch (1==1) l3 l4
+    branch true l3 l4
    l3:
     print 1
     drop y
@@ -673,7 +696,9 @@ let do_test_const_prop_driver () =
   test {input|
     const a = 1
     const b = 2
-    mut c = 5
+    const ccc = 5
+    const cc = ccc
+    mut c = (cc + 0)
     c <- (a + b)
     const d = true
     branch d l1 l2
@@ -690,7 +715,7 @@ let do_test_const_prop_driver () =
     stop 0
   |input} {expect|
     mut c = 5
-    c <- (1 + 2)
+    c <- 3
     branch true l1 l2
    l1:
     c <- (c + 1)
@@ -717,8 +742,9 @@ let do_test_const_prop_driver () =
     stop 0
    bla:
     const z = 1
+    const zz = z
     mut x = 1
-    mut y = z
+    mut y = (zz + 0)
     goto loop
   |input} {expect|
     goto bla
@@ -737,7 +763,7 @@ let do_test_const_prop_driver () =
   test {input|
     const x = 1
     const t = true
-    const a = 10
+    const a = (10 + 0)
     const b = 20
     const c = 30
     branch t la lb
@@ -746,7 +772,7 @@ let do_test_const_prop_driver () =
    lb:
     branch t l2 l3
    l1:
-    print a
+    print (a + 0)
     goto fin
    l2:
     print b
@@ -774,9 +800,65 @@ let do_test_const_prop_driver () =
     print 30
     goto fin
    fin:
-    const y = (1 + 1)
-    print y
+    print 2
     stop 0
+  |expect};
+  (* Propagating function references *)
+  test {input|
+    const f = 'foo
+    call x = f ()
+    mut g = 'foo
+    call y = g ()
+   function foo ()
+    return 42
+  |input} {expect|
+    call x = 'foo ()
+    mut g = 'foo
+    call y = g ()
+   function foo ()
+    return 42
+  |expect};
+  (* Constant folding within functions *)
+  test {input|
+    const a = 1
+    mut b = 2
+    call w = 'f ((a + a))
+    call y = 'f (b)
+    call z = 'g (&b)
+   function f (const n)
+    const a = (2 + 3)
+    return a
+   function g (mut m)
+    const b = 42
+    m <- b
+    return m
+  |input} {expect|
+    mut b = 2
+    call w = 'f (2)
+    call y = 'f (b)
+    call z = 'g (&b)
+   function f (const n)
+    return 5
+   function g (mut m)
+    m <- 42
+    return m
+  |expect};
+  (* Copy propagation of formal parameters *)
+  test {input|
+    call z = 'foo (1, 2)
+   function foo (const x, mut y)
+    const a = x
+    const b = y
+    print a
+    print b
+    return (0 + 0)
+  |input} {expect|
+    call z = 'foo (1, 2)
+   function foo (const x, mut y)
+    const b = y
+    print x
+    print b
+    return 0
   |expect};
   ()
 
@@ -1462,7 +1544,7 @@ let suite =
    "liveness">:: do_test_liveness;
    "codemotion">:: do_test_codemotion;
    "min_lifetimes">:: do_test_minimize_lifetime;
-   "constant_prop">:: do_test_const_prop_driver;
+   "constant_fold">:: do_test_const_fold_driver;
    "push_drop">:: do_test_push_drop;
    "pull_drop">:: do_test_pull_drop;
    "move_drop">:: do_test_drop_driver;
