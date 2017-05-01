@@ -1,10 +1,10 @@
 open Instr
 
 (*
- * Constant folding
+ * Constant folding.
  *
  * This optimization combines constant propagation, copy propagation, and
- * constant folding.
+ * constant folding. We assume the program is well-scoped.
  *
  * The strategy is to maintain a "propagation environment" mapping variables to
  * simple expressions (constants or variables) and apply the `normalize`
@@ -20,36 +20,43 @@ let const_fold (({formals; instrs} as inp) : analysis_input) : instructions opti
 
   (* Perform constant and copy propagation on the expression `exp`, using
    * the mappings in `penv`.
-   * Returns an updated expression. *)
+   * Returns a pair of the updated expression and changed status. *)
   let propagate exp penv =
-    let try_prop x e =
+    let try_prop x (e, c) =
       if Prop_env.mem x penv
-      then Edit.replace_var_in_exp x (Prop_env.find x penv) e else e in
-    VarSet.fold try_prop (expr_vars exp) exp
+      then
+        (Edit.replace_var_in_exp x (Prop_env.find x penv) e, true)
+      else (e, c || false) in
+    VarSet.fold try_prop (expr_vars exp) (exp, false)
   in
 
   (* Constant fold the expression `exp`.
-   * Returns an updated expression. *)
+   * Returns a pair of the updated expression and changed status. *)
   let fold exp =
     match[@warning "-4"] exp with
-    | Simple _ -> exp
+    | Simple _ -> (exp, false)
     | Op (op, [Constant(v1); Constant(v2)]) ->
       begin match op with
-      | Eq -> Simple (Constant (Bool (Eval.value_eq v1 v2)))
-      | Neq -> Simple (Constant (Bool (Eval.value_neq v1 v2)))
-      | Plus -> Simple (Constant (Int (Eval.value_plus v1 v2)))
+      | Eq -> (Simple (Constant (Bool (Eval.value_eq v1 v2))), true)
+      | Neq -> (Simple (Constant (Bool (Eval.value_neq v1 v2))), true)
+      | Plus -> (Simple (Constant (Int (Eval.value_plus v1 v2))), true)
       end
-    | Op (_, _es) -> exp
+    | Op (_, _es) -> (exp, false)
   in
 
   (* Try to add a new mapping to the environment. `exp` is the simple expression
-   * being bound to the constant variable `x`. *)
-  let try_add x exp scope penv =
+   * being bound to the constant variable `x`.
+   * We need `pc` to infer the scope. *)
+  let try_add x exp pc penv =
     match exp with
     | Simple (Constant v) -> Prop_env.add x (Constant v) penv
     | Simple (Var v) ->
-      (* `exp` is a variable v, need to check if `v` is const or mut. *)
-      begin match scope with
+      (* We have the declaration `const x = v`. Check if `v` is const or mut.
+       * Normally, if `v` is const, at this point it would already be replaced
+       * by a constant value. However, if `v` is a const parameter, then we
+       * need to do the check here and copy propagate it. *)
+      let scope = Scope.infer inp in
+      begin match scope.(pc) with
       | DeadScope -> penv
       | Scope scope ->
         try
@@ -63,67 +70,99 @@ let const_fold (({formals; instrs} as inp) : analysis_input) : instructions opti
     | Op _ -> penv
   in
 
-  (* Normalize all expressions within `instr`, given a propagation environment.
-   * Perform propagation, then folding.
-   * Returns a pair of the new environment and the new instruction. *)
-  let normalize instr scope penv =
-    let prop_fold e = fold (propagate e penv) in
+  (* Normalize all expressions within the instr at `pc`, given a propagation
+   * environment. Perform propagation, then folding.
+   * Returns a triple of the new env, new instruction, and changed status. *)
+  let normalize pc penv =
+    (* Propagate, then fold, keeping track of changed status. *)
+    let prop_fold e =
+      let (e', changed1) = propagate e penv in
+      let (e', changed2) = fold e' in
+      (e', changed1 || changed2)
+    in
+    let instr = instrs.(pc) in
     match instr with
     | Decl_const (x, e) ->
-      let e' = prop_fold e in
+      let (e', changed) = prop_fold e in
       (* Constant declaration, so we might need to update the nevironment. *)
-      (try_add x e' scope penv, Decl_const (x, e'))
-    | Decl_mut (x, Some e) -> (penv, Decl_mut (x, Some (prop_fold e)))
+      (try_add x e' pc penv, Decl_const (x, e'), changed)
+    | Decl_mut (x, Some e) ->
+      let (e', changed) = prop_fold e in
+      (penv, Decl_mut (x, Some e'), changed)
     | Call (x, e, args) ->
-      let args' = List.map (fun arg ->
+      let (e', status) = prop_fold e in
+      let res = List.map (fun arg ->
         match arg with
-        | Arg_by_val e -> Arg_by_val (prop_fold e)
-        | Arg_by_ref _ -> arg) args
+        | Arg_by_val e ->
+          let (e', status) = prop_fold e in
+          (Arg_by_val e', status)
+        | Arg_by_ref _ -> (arg, false)) args
       in
-      (penv, Call (x, prop_fold e, args'))
-    | Return e -> (penv, Return (prop_fold e))
-    | Assign (x, e) -> (penv, Assign (x, prop_fold e))
-    | Branch (e, l1, l2) -> (penv, Branch (prop_fold e, l1, l2))
-    | Print e -> (penv, Print (prop_fold e))
+      let (args', statuses) = List.split res in
+      let changed = List.exists (fun b -> b) (status :: statuses) in
+      (penv, Call (x, e', args'), changed)
+    | Return e ->
+      let (e', changed) = prop_fold e in
+      (penv, Return e', changed)
+    | Assign (x, e) ->
+      let (e', changed) = prop_fold e in
+      (penv, Assign (x, e'), changed)
+    | Branch (e, l1, l2) ->
+      let (e', changed) = prop_fold e in
+      (penv, Branch (e', l1, l2), changed)
+    | Print e ->
+      let (e', changed) = prop_fold e in
+      (penv, Print e', changed)
     | Osr (e, tf, tv, tl, osr_env) ->
-      let osr_env' = List.map (fun osr_def ->
+      let (e', status) = prop_fold e in
+      let res = List.map (fun osr_def ->
         match osr_def with
-        | Osr_const (y, e) -> Osr_const (y, prop_fold e)
-        | Osr_mut (y, e) -> Osr_mut (y, prop_fold e)
-        | Osr_mut_ref _ | Osr_mut_undef _ -> osr_def) osr_env
+        | Osr_const (y, e) ->
+          let (e', status) = prop_fold e in
+          (Osr_const (y, e'), status)
+        | Osr_mut (y, e) ->
+          let (e', status) = prop_fold e in
+          (Osr_mut (y, e'), status)
+        | Osr_mut_ref _ | Osr_mut_undef _ -> (osr_def, false)) osr_env
       in
-      (penv, Osr (prop_fold e, tf, tv, tl, osr_env'))
-    | Stop e -> (penv, Stop (prop_fold e))
+      let (osr_env', statuses) = List.split res in
+      let changed = List.exists (fun b -> b) (status :: statuses) in
+      (penv, Osr (e', tf, tv, tl, osr_env'), changed)
+    | Stop e ->
+      let (e', changed) = prop_fold e in
+      (penv, Stop e', changed)
     | Drop x ->
       (* `x` no longer in scope, so remove it from the environment. *)
-      (Prop_env.remove x penv, instr)
+      (Prop_env.remove x penv, instr, false)
     | Decl_mut (_, None) | Clear _ | Read _
-    | Label _ | Goto _ | Comment _ -> (penv, instr)
+    | Label _ | Goto _ | Comment _ -> (penv, instr, false)
   in
 
   (* Perform the optimization over the functions.
    * `instrs` is the instruction stream to optimize, `worklist` is the worklist,
-   * and `seen` is a PcSet that keeps track of PCs we already processed (to
-   * avoid infinite looping).
+   * `seen` is a PcSet that keeps track of PCs we already processed (to avoid
+   * infinite looping), and `changed` tracks whether the instruction stream was
+   * changed.
    *
    * `normalize` returns a pair of the new environment and new instruction.
    * That new environment must be used for all successors of the current
    * instruction, which is why it is included in the worklist.
    * *)
-  let rec work instrs worklist seen =
+  let rec work instrs worklist seen changed =
     let open Analysis in
     match worklist with
-    | [] -> Some instrs
-    | (_, pc) :: rest when PcSet.mem pc seen -> work instrs rest seen
+    | [] -> if changed then Some instrs else None
+    | (_, pc) :: rest when PcSet.mem pc seen -> work instrs rest seen changed
     | (penv, pc) :: rest ->
-      let scope = Scope.infer inp in
-      let (penv, instr) = normalize instrs.(pc) scope.(pc) penv in
+      let (penv, instr, changed') = normalize pc penv in
+      (* Assume program is well-scoped,
+       * i.e. we have the same vars on all successors. *)
       let succs = List.map (fun pc -> (penv, pc)) (successors_at instrs pc) in
       instrs.(pc) <- instr;
-      work instrs (succs @ rest) (PcSet.add pc seen)
+      work instrs (succs @ rest) (PcSet.add pc seen) (changed || changed')
   in
 
-  work (Array.copy instrs) [(Prop_env.empty, 0)] Analysis.PcSet.empty
+  work (Array.copy instrs) [(Prop_env.empty, 0)] Analysis.PcSet.empty false
 
 
 open Transform_utils

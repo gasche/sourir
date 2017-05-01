@@ -613,7 +613,7 @@ let do_test_const_fold_driver () =
     let input, expected = (parse t), (parse e) in
     let output = try_opt (as_opt_program const_fold) input in
     if (Disasm.disassemble_s output) <> (Disasm.disassemble_s expected) then begin
-      Printf.printf "input: '%s'\noutput: '%s'\nexpected: '%s'\n%!"
+      Printf.printf "\ninput: '%s'\noutput: '%s'\nexpected: '%s'\n%!"
         (Disasm.disassemble_s input)
         (Disasm.disassemble_s output)
         (Disasm.disassemble_s expected);
@@ -829,7 +829,7 @@ let do_test_const_fold_driver () =
     const a = (2 + 3)
     return a
    function g (mut m)
-    const b = 42
+    const b = (42 + 0)
     m <- b
     return m
   |input} {expect|
