@@ -45,47 +45,40 @@ let const_fold (({formals; instrs} as inp) : analysis_input) : instructions opti
   in
 
   (* Try to add a new mapping to the environment. `exp` is the simple expression
-   * being bound to the constant variable `x`.
-   * We need `pc` to infer the scope. *)
-  let try_add x exp pc penv =
+   * being bound to the constant variable `x`. *)
+  let try_add x exp formals penv =
     match exp with
     | Simple (Constant v) -> Prop_env.add x (Constant v) penv
     | Simple (Var v) ->
-      (* We have the declaration `const x = v`. Check if `v` is const or mut.
-       * Normally, if `v` is const, at this point it would already be replaced
-       * by a constant value. However, if `v` is a const parameter, then we
-       * need to do the check here and copy propagate it. *)
-      let scope = Scope.infer inp in
-      begin match scope.(pc) with
-      | DeadScope -> penv
-      | Scope scope ->
-        try
-          (* If `v` is mut, we'll get an `Incomparable` exception. *)
-          ignore (ModedVarSet.find (Const_var, v) scope);
-          Prop_env.add x (Var v) penv
-        with
-        | Not_found -> assert(false)
-        | Incomparable -> penv
+      (* We have the declaration `const x = v`. If `v` is a compile time const,
+       * then we would have already performed constant propagation and replaced
+       * `v`. Since we did not, `v` is either a mutable variable or a run time
+       * const (i.e. a constant parameter). *)
+      begin try
+        ignore (ModedVarSet.find (Const_var, v) formals);
+        Prop_env.add x (Var v) penv
+      with
+      (* `v` is not a parameter or it is a mutable parameter. *)
+      | Not_found | Incomparable -> penv
       end
     | Op _ -> penv
   in
 
-  (* Normalize all expressions within the instr at `pc`, given a propagation
-   * environment. Perform propagation, then folding.
+  (* Normalize all expressions within `instr`, given a propagation environment.
+   * Perform propagation, then folding.
    * Returns a triple of the new env, new instruction, and changed status. *)
-  let normalize pc penv =
+  let normalize instr formals penv =
     (* Propagate, then fold, keeping track of changed status. *)
     let prop_fold e =
       let (e', changed1) = propagate e penv in
       let (e', changed2) = fold e' in
       (e', changed1 || changed2)
     in
-    let instr = instrs.(pc) in
     match instr with
     | Decl_const (x, e) ->
       let (e', changed) = prop_fold e in
       (* Constant declaration, so we might need to update the nevironment. *)
-      (try_add x e' pc penv, Decl_const (x, e'), changed)
+      (try_add x e' formals penv, Decl_const (x, e'), changed)
     | Decl_mut (x, Some e) ->
       let (e', changed) = prop_fold e in
       (penv, Decl_mut (x, Some e'), changed)
@@ -154,7 +147,7 @@ let const_fold (({formals; instrs} as inp) : analysis_input) : instructions opti
     | [] -> if changed then Some instrs else None
     | (_, pc) :: rest when PcSet.mem pc seen -> work instrs rest seen changed
     | (penv, pc) :: rest ->
-      let (penv, instr, changed') = normalize pc penv in
+      let (penv, instr, changed') = normalize instrs.(pc) formals penv in
       (* Assume program is well-scoped,
        * i.e. we have the same vars on all successors. *)
       let succs = List.map (fun pc -> (penv, pc)) (successors_at instrs pc) in
