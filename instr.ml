@@ -49,6 +49,10 @@ module ModedVarSet = struct
     let muts = filter (fun (m,v) -> m = Mut_var) set in
     untyped muts
 
+  let consts set =
+    let consts = filter (fun (m,v) -> m = Const_var) set in
+    untyped consts
+
   let diff_untyped typed untyped =
     filter (fun (_m, x) -> not (VarSet.mem x untyped)) typed
 

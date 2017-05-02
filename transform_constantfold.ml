@@ -1,5 +1,9 @@
 open Instr
 
+type constant =
+  | Runtime_const
+  | Compiletime_const of simple_expression
+
 (*
  * Constant folding.
  *
@@ -15,7 +19,7 @@ open Instr
  * added to the environment. `drop x` will remove `x` and its mapping from the
  * environment.
  *)
-let const_fold (({formals; instrs} as inp) : analysis_input) : instructions option =
+let const_fold ({formals; instrs} : analysis_input) : instructions option =
   let module Prop_env = Map.Make(Variable) in
 
   (* Perform constant and copy propagation on the expression `exp`, using
@@ -23,10 +27,11 @@ let const_fold (({formals; instrs} as inp) : analysis_input) : instructions opti
    * Returns a pair of the updated expression and changed status. *)
   let propagate exp penv =
     let try_prop x (e, c) =
-      if Prop_env.mem x penv
-      then
-        (Edit.replace_var_in_exp x (Prop_env.find x penv) e, true)
-      else (e, c || false) in
+      match Prop_env.find x penv with
+      | exception Not_found -> (e, c)
+      | Runtime_const -> (e, c)
+      | Compiletime_const const -> (Edit.replace_var_in_exp x const e, true)
+    in
     VarSet.fold try_prop (expr_vars exp) (exp, false)
   in
 
@@ -44,23 +49,25 @@ let const_fold (({formals; instrs} as inp) : analysis_input) : instructions opti
     | Op (_, _es) -> (exp, false)
   in
 
-  (* Try to add a new mapping to the environment. `exp` is the simple expression
+  (* Add a new mapping to the environment. `exp` is the simple expression
    * being bound to the constant variable `x`. *)
-  let try_add x exp formals penv =
+  let add x exp formals penv =
     match exp with
-    | Simple (Constant v) -> Prop_env.add x (Constant v) penv
-    | Simple (Var v) ->
-      (* We have the declaration `const x = v`. If `v` is a compile time const,
-       * then we would have already performed constant propagation and replaced
-       * `v`. Since we did not, `v` is either a mutable variable or a run time
-       * const (i.e. a constant parameter). *)
-      begin try
-        ignore (ModedVarSet.find (Const_var, v) formals);
-        Prop_env.add x (Var v) penv
-      with
-      (* `v` is not a parameter or it is a mutable parameter. *)
-      | Not_found | Incomparable -> penv
-      end
+    | Simple (Constant v) ->
+      Prop_env.add x (Compiletime_const (Constant v)) penv
+    | Simple (Var y) ->
+      (* We have the declaration `const x = y`.
+       * If `y` is not in our mapping, then `x` is a compile time const (since
+       * it was declared as const). If `y` is a run time const, then we know `x`
+       * is a constant alias to `y`. Otherwise, assert(false), since if `y` is a
+       * compile time const, we should have already propagated its value. *)
+      let res =
+        match Prop_env.find y penv with
+        | exception Not_found -> Runtime_const
+        | Runtime_const -> Compiletime_const (Var y)
+        | Compiletime_const _ -> assert(false)
+      in
+      Prop_env.add x res penv
     | Op _ -> penv
   in
 
@@ -78,7 +85,7 @@ let const_fold (({formals; instrs} as inp) : analysis_input) : instructions opti
     | Decl_const (x, e) ->
       let (e', changed) = prop_fold e in
       (* Constant declaration, so we might need to update the nevironment. *)
-      (try_add x e' formals penv, Decl_const (x, e'), changed)
+      (add x e' formals penv, Decl_const (x, e'), changed)
     | Decl_mut (x, Some e) ->
       let (e', changed) = prop_fold e in
       (penv, Decl_mut (x, Some e'), changed)
@@ -155,7 +162,12 @@ let const_fold (({formals; instrs} as inp) : analysis_input) : instructions opti
       work instrs (succs @ rest) (PcSet.add pc seen) (changed || changed')
   in
 
-  work (Array.copy instrs) [(Prop_env.empty, 0)] Analysis.PcSet.empty false
+  (* Initialize environment with constant formals mapped to Runtime_const. *)
+  let const_args = ModedVarSet.consts formals in
+  let initial_env = VarSet.fold
+    (fun x xs -> Prop_env.add x Runtime_const xs) const_args Prop_env.empty in
+
+  work (Array.copy instrs) [(initial_env, 0)] Analysis.PcSet.empty false
 
 
 open Transform_utils

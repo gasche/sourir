@@ -860,6 +860,22 @@ let do_test_const_fold_driver () =
     print b
     return 0
   |expect};
+  (* Copy propagation of runtime consts *)
+  test {input|
+    call c = foo (0)
+    return c
+   function foo (const x)
+    const y = x
+    const z = y
+    print z
+    return z
+  |input} {expect|
+    call c = foo (0)
+    return c
+   function foo (const x)
+    print x
+    return x
+  |expect};
   ()
 
 let do_test_pull_drop () =
