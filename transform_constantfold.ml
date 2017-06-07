@@ -34,6 +34,7 @@ let const_fold : transform_instructions = fun {formals; instrs} ->
       let all_propagated = ref true in
       let propagate x e =
         match VarMap.find x env with
+        | exception Not_found -> all_propagated := false; e
         | Approx.Unknown -> all_propagated := false; e
         | Approx.Value l -> (Edit.replace_var x (Constant l))#expression e
       in
@@ -105,7 +106,45 @@ let const_fold : transform_instructions = fun {formals; instrs} ->
       let add_formal x st = VarMap.add x Unknown st in
       VarSet.fold add_formal formals VarMap.empty
     in
-    Analysis.forward_analysis initial_state instrs merge update
+
+    let next = Analysis.successors instrs in
+    let program_state = Array.map (fun _ -> None) instrs in
+    let rec work = function
+    | [] -> ()
+    | (in_state, pc) :: rest ->
+        let merged =
+          match program_state.(pc) with
+          | None -> Some in_state
+          | Some cur_state -> merge pc cur_state in_state
+        in begin match merged with
+        | None -> work rest
+        | Some new_state ->
+            program_state.(pc) <- merged;
+            let updated = update pc new_state in
+            let continue = match instrs.(pc) with
+              | Branch (e, l1, l2) ->
+                let e_opt = (fold new_state)#expression e in
+                if e <> e_opt then prerr_endline
+                  (Disasm.disassemble_instrs_s
+                     [| Return (Simple (Constant (Int pc)));
+                        Return e;
+                        Return e_opt |]);
+                begin match e_opt with
+                  | Simple (Constant (Bool b)) ->
+                    [Instr.resolve instrs (BranchLabel (if b then l1 else l2))]
+                  | _ -> next.(pc)
+                end
+              | _ -> next.(pc) in
+            let new_work = List.map (fun pc' -> (updated, pc')) continue in
+            work (new_work @ rest)
+        end
+    in
+    let starts = Analysis.starts instrs in
+    work (List.map (fun pc -> (initial_state, pc)) starts);
+    (fun pc ->
+       match program_state.(pc) with
+       | None -> VarMap.empty
+       | Some env -> env)
   in
 
   let transform_instr pc instr =

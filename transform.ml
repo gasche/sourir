@@ -121,6 +121,8 @@ let optimize (opts : string list) (prog : program) : program option =
       as_opt_program branch_prune
     | "inline" ->
       Transform_inline.inline
+    | "cleanup" ->
+      as_opt_program cleanup_all
     | o ->
       raise (UnknownOptimization o)
   in
