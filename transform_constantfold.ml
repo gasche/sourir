@@ -170,7 +170,11 @@ let const_fold : transform_instructions = fun {formals; instrs} ->
         assert (VarMap.mem x cur);
         (* the array case could be improved with approximation for
            arrays *)
-        VarMap.add x Unknown cur
+        (* arrays may inline: all array optimizations must be pessimized! *)
+        let pessimize_array = function
+          | Approx.Array arr -> Approx.Array (Array.map (fun _ -> Approx.Unknown) arr)
+          | approx -> approx in
+        VarMap.map pessimize_array cur
       | ( Branch _ | Label _ | Goto _ | Return _
         | Print _ | Assert _ | Stop _ | Osr _ | Comment _)
         as instr ->
