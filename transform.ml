@@ -70,6 +70,7 @@ let optimistic_as_opt_function (transformation : create_optimistic_version)
 
 (* All available optimizations *)
 let cleanup_all_instrs = combine_transform_instructions [
+    Transform_cleanup.remove_dead_branches;
     Transform_cleanup.remove_unreachable_code;
     Transform_cleanup.remove_unused_decl;
     Transform_cleanup.remove_jmp;]

@@ -23,6 +23,33 @@ let remove_jmp : transform_instructions = fun ({instrs; _} as inp) ->
   in
   change_instrs transform inp
 
+let remove_dead_branches : transform_instructions = fun ({instrs} as inp) ->
+  let optimize_branch pc b l1 l2 =
+    let alive, dead = if b then (l1, l2) else (l2, l1) in
+    let pc_alive, pc_dead =
+      Instr.resolve instrs (BranchLabel alive),
+      Instr.resolve instrs (BranchLabel dead) in
+    let label_alive = alive in
+    let label_dead = "dead_" ^ dead in
+    [
+      (pc, 1, [| Goto label_alive |]);
+      (pc_alive, 1, [| Label (MergeLabel label_alive) |]);
+      (pc_dead, 1, [| Label (MergeLabel label_dead) |]);
+    ]
+  in    
+  let rec loop pc acc =
+    if pc = Array.length instrs then acc
+    else
+      let substs = match instrs.(pc) with
+        | Branch (Simple (Constant (Bool b)), l1, l2) -> optimize_branch pc b l1 l2
+        | _ -> []
+      in loop (pc + 1) (substs @ acc)
+  in match loop 0 [] with
+  | [] -> None
+  | edits ->
+    let instrs, _ = Edit.subst_many instrs edits in
+    Some instrs
+
 let remove_unreachable_code : transform_instructions = fun ({instrs} as inp) ->
   let reachable =
     let merge _ _ _ = None in

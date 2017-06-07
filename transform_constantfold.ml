@@ -18,24 +18,62 @@ open Types
 let const_fold : transform_instructions = fun {formals; instrs} ->
   let module VarMap = Map.Make(Variable) in
   let module Approx = struct
-    type t = Unknown | Value of value
-    let equal a1 a2 = match a1, a2 with
+    type t = Unknown | Value of value | Array of t array
+    let rec equal a1 a2 = match a1, a2 with
       | Unknown, Unknown -> true
-      | Unknown, Value _ | Value _, Unknown -> false
+      | Unknown, _ | _, Unknown -> false
       | Value v1, Value v2 -> Eval.value_eq v1 v2
+      | Value _, _ | _, Value _ -> false
+      | Array v1s, Array v2s ->
+        if Array.length v1s <> Array.length v2s then false
+        else begin
+          try
+            for i = 0 to Array.length v1s - 1 do
+              if not (equal v1s.(i) v2s.(i)) then raise Exit
+            done; true
+          with Exit -> false
+        end
+
+    let rec merge ap1 ap2 = match ap1, ap2 with
+      | Value v1, Value v2 ->
+        if Eval.value_eq v1 v2 then Value v1 else Unknown
+      | Array ap1s, Array ap2s ->
+        if Array.length ap1s <> Array.length ap2s then Unknown
+        else Array (Array.mapi (fun i _ -> merge ap1s.(i) ap2s.(i)) ap1s)
+      | Value _, Array _ | Array _, Value _ -> Unknown
+      | Unknown, _ | _, Unknown -> Unknown
   end in
+
+  let lookup x env = try VarMap.find x env with Not_found -> Approx.Unknown in
 
   (* constant-fold by evaluating expressions
      that become closed after approximation-environment substitution *)
-  let fold env = object
+  let fold env = object (self)
     inherit Instr.map as super
 
-    method! expression exp =
+    method array_opts exp = match[@warning "-4"] exp with
+      | Array_index (x, e) ->
+        begin match[@warning "-4"] lookup x env, self#simple_expression e with
+          | Approx.Array approxs, Constant (Int n) ->
+            begin match approxs.(n) with
+            | exception _ -> exp
+            | Approx.Value v -> Simple (Constant v)
+            | Approx.Array _ | Approx.Unknown -> exp
+            end
+          | _, _ -> exp
+        end
+      | Array_length (Var x) ->
+        begin match lookup x env with
+          | Approx.Array approxs -> Simple (Constant (Int (Array.length approxs)))
+          | Approx.Value _ | Approx.Unknown -> exp
+        end
+      | _ -> exp
+
+    method try_eval_closed exp =
       let all_propagated = ref true in
       let propagate x e =
-        match VarMap.find x env with
-        | exception Not_found -> all_propagated := false; e
-        | Approx.Unknown -> all_propagated := false; e
+        match lookup x env with
+        | Approx.Unknown | Approx.Array _ -> all_propagated := false; e
         | Approx.Value l -> (Edit.replace_var x (Constant l))#expression e
       in
       let eval_closed exp =
@@ -47,6 +85,43 @@ let const_fold : transform_instructions = fun {formals; instrs} ->
         (* A closed expression might still fail to evaluate (eg. 1+true) *)
         try Simple (Constant (eval_closed exp)) with
         | _ -> exp
+
+    method approximate_equalities = function
+      | Binop ((Eq | Neq) as op, e1, e2) as exp ->
+        let open Approx in
+        let approx se = match self#simple_expression se with
+          | Constant v -> Value v
+          | Var x -> lookup x env
+        in
+        begin match approx e1, approx e2 with
+        | Unknown, _ | _, Unknown -> exp
+        | Value _, Value _ ->
+          (* this case will be optimized by try_eval_closed *)
+          exp
+        | Value (Array _), Array _
+        | Array _, Value (Array _)
+        | Array _, Array _
+          -> exp
+        | Array _, Value (Nil | Bool _ | Int _ | Fun_ref _)
+        | Value (Nil | Bool _ | Int _ | Fun_ref _), Array _
+          -> Simple (Constant (Bool (op <> Eq)))
+        end
+      | exp -> exp
+
+    method! simple_expression = function
+      | Constant v -> Constant v
+      | Var x ->
+        begin match lookup x env with
+          | Approx.Unknown -> Var x
+          | Approx.Value v -> Constant v
+          | Approx.Array _ -> Var x
+        end
+
+    method! expression exp =
+      exp
+      |> self#try_eval_closed
+      |> self#array_opts
+      |> self#approximate_equalities
   end in
 
   (* for each instruction, what is the set of variables that are constant? *)
@@ -55,30 +130,35 @@ let const_fold : transform_instructions = fun {formals; instrs} ->
     let open Approx in
 
     let merge pc cur incom =
-      let merge_approx x mv1 mv2 = match mv1, mv2 with
-        | Some Unknown, _ | _, Some Unknown -> Some Unknown
-        | Some (Value v1), Some (Value v2) ->
-          if Eval.value_eq v1 v2 then Some (Value v1) else Some Unknown
-        | None, _ | _, None -> (*BISECT-IGNORE*) failwith "scope error?"
-      in
+      let merge_approx x m1 m2 = match m1, m2 with
+        | None, _ | _, None -> None
+        | Some ap1, Some ap2 -> Some (Approx.merge ap1 ap2) in
       if VarMap.equal Approx.equal cur incom then None
       else Some (VarMap.merge merge_approx cur incom)
     in
 
+    let approx env exp = match (fold env)#expression exp with
+      | Simple (Constant l) -> Value l
+      | Simple (Var x) -> lookup x env
+      | Unop _ | Binop _ | Array_index _ | Array_length _ -> Unknown
+    in
+    let approx_array_by_decl env = function
+      | Instr.Length e ->
+        begin match approx env e with
+          | Value (Int n) -> Array (Array.make n (Value Nil))
+          | Value _ | Unknown | Array _ -> Unknown
+        end
+      | Instr.List es ->
+        Array (Array.of_list (List.map (approx env) es))
+    in
+
     let update pc cur =
-      let approx env exp = match (fold env)#expression exp with
-        | Simple (Constant l) -> Value l
-        | Simple (Var _)
-        | Unop _ | Binop _ | Array_index _ | Array_length _ -> Unknown
-      in
       match[@warning "-4"] instrs.(pc) with
       | Decl_var (x, e)
       | Assign (x, e) ->
         VarMap.add x (approx cur e) cur
-      | Decl_array (x, _) ->
-        (* this case could be improved with approximation for arrays so
-           that, eg., length(x) could be constant-folded *)
-        VarMap.add x Unknown cur
+      | Decl_array (x, decl) ->
+        VarMap.add x (approx_array_by_decl cur decl) cur
       | Call (x, _, _) as call ->
         let mark_unknown x cur = VarMap.add x Unknown cur in
         cur
